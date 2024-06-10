@@ -8,9 +8,13 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/ether.h>
+#include <net/if.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <linux/if_packet.h>
 
 #define ETHER_PACKET_LEN 14
 #define FORWARD 0
@@ -20,14 +24,28 @@
 
 void tcp_block(const unsigned char* packet, uint32_t p_len, int type, char* block_data);
 bool check_block(int type, char* block_data, const unsigned char* payload, int payload_len);
-void blocking(unsigned char* packet, uint32_t p_len);
-void make_packet(unsigned char* block_packet, unsigned char* org_packet, int type, uint32_t p_len);
-void send_forward(const unsigned char* packet);
-void send_backward(const unsigned char* packet);
+void blocking(const unsigned char* packet, uint32_t p_len);
+void make_packet(unsigned char* block_packet, const unsigned char* org_packet, int type, uint32_t p_len);
+void send_packet(const unsigned char* packet, uint32_t send_len);
+unsigned short checksum(void *b, int len);
+
+struct pseudo_header {
+    struct in_addr source_addr;
+    struct in_addr dest_addr;
+    uint8_t placeholder;
+    uint8_t protocol;
+    uint16_t tcp_length;
+    struct tcphdr tcp;
+};
 
 uint8_t my_mac[6];
 const char* backward_tcpdata = "HTTP/1.0 302 Redirect\r\nLocation: http://warning.or.kr\r\n\r\n";
 int backward_datalen;
+
+int sd;
+char sock_buffer[1514];
+struct ifreq ifr_;
+struct sockaddr_ll sa;
 
 void usage() {
     printf("[SNS] TCP Block Usage\n");
@@ -68,21 +86,36 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // get self mac address
-    int sockfd = socket(Af_INET, SOCK_DGRAM, 0);
+    // 
+    backward_datalen = strlen(backward_tcpdata);
 
+    // make raw socket
+    sd = socket(AF_PACKET, SOCK_RAW, IPPROTO_RAW);
+    if (sd < 0) {
+        fprintf(stderr, "Fail to make socket\n");
+        return -1;
+    }
+
+    memset(&ifr_, 0, sizeof(ifr_));
+    strncpy(ifr_.ifr_name, param._dev, IFNAMSIZ - 1);
+    if (ioctl(sd, SIOCGIFINDEX, &ifr_) == -1) {
+        fprintf(stderr, "set network interface fail\n");
+        close(sd);
+        return -1;
+    }
+    sa.sll_ifindex = ifr_.ifr_ifindex;
+    sa.sll_halen = ETH_ALEN;
+
+    // get self mac address
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, param._dev, IFNAMSIZ - 1);
 
-    if (ioctl(sockfd, SIOCGIFHWADDR, &ifr) < 0) {
+    if (ioctl(sd, SIOCGIFHWADDR, &ifr) < 0) {
         fprintf(stderr, "Fail to get MAC address\n");
         return -1;
     }
     memcpy(my_mac, ifr.ifr_hwaddr.sa_data, 6);
-
-    // 
-    backward_datalen = strlen(backward_tcpdata);
 
     // open pcap handle
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -105,6 +138,7 @@ int main(int argc, char* argv[]) {
         
         tcp_block(packet, header->caplen, param.type, param._data);
     }
+    close(sd);
     free(param._data);
     free(param._dev);
 
@@ -137,11 +171,11 @@ void tcp_block(const unsigned char* packet, uint32_t p_len, int type, char* bloc
         if (ntohs(tcp_header->th_dport) == 80 && payload_len > 0) {
             if (check_block(type, block_data, payload, payload_len)) {
                 printf("Target detected\n");
-                blocking(packet);
+                blocking(packet, p_len);
             }
         }
         else if (ntohs(tcp_header->th_dport) == 443 && payload_len >0) {
-
+            
         }
     }
 }
@@ -158,74 +192,126 @@ bool check_block(int type, char* block_data, const unsigned char* payload, int p
     return false;
 }
 
-void blocking(unsigned char* packet, uint32_t p_len) {
+void blocking(const unsigned char* packet, uint32_t p_len) {
     unsigned char forward_packet[100];
     unsigned char backward_packet[100];
 
-    make_packet(forward_packet, packet, FORWARD);
-    make_packet(backward_packet, packet, BACKWARD);
+    make_packet(forward_packet, packet, FORWARD, p_len);
+    make_packet(backward_packet, packet, BACKWARD, p_len);
 
-    send_forward(forward_packet);
-    send_backward(backward_packet);
+    send_packet(forward_packet, BLOCK_PACKET_HEADER_LEN);
+    send_packet(backward_packet, BLOCK_PACKET_HEADER_LEN + backward_datalen);
 }
 
-void make_packet(unsigned char* block_packet, unsigned char* org_packet, int type, uint32_t p_len) {
+void make_packet(unsigned char* block_packet, const unsigned char* org_packet, int type, uint32_t p_len) {
     if (p_len > 100) {
         p_len = 100;
     }
-    memcpy(block_packet, org_packet, p_len);
+    memset(block_packet, 0, 100);
     struct ether_header *eth_header;
+    struct ether_header *org_eth_header;
     struct ip *ip_header;
+    struct ip *org_ip_header;
     struct tcphdr* tcp_header;
+    struct tcphdr* org_tcp_header;
 
     // ethernet
     eth_header = (struct ether_header*)block_packet;
+    org_eth_header = (struct ether_header*)org_packet;
     if (type == BACKWARD) {
         for (int i = 0; i < 6; i++) {
-            eth_header.ether_dhost[i] = eth_header.ether_shost[i];
+            eth_header->ether_dhost[i] = org_eth_header->ether_shost[i];
+        }
+    }
+    else if (type == FORWARD) {
+        for (int i = 0; i < 6; i++) {
+            eth_header->ether_dhost[i] = org_eth_header->ether_dhost[i];
         }
     }
     for (int i = 0; i < 6; i++) {
-        eth_header.ether_shost[i] = my_mac[i];
+        eth_header->ether_shost[i] = my_mac[i];
     }
+    eth_header->ether_type = 0x0008;
 
     // ip
     ip_header = (struct ip*)(block_packet + ETHER_PACKET_LEN);
-    ip_header->ip_len = 54;
+    org_ip_header = (struct ip*)(org_packet + ETHER_PACKET_LEN);
+    ip_header->ip_hl = 5;
+    ip_header->ip_v = 4;
+    ip_header->ip_tos = 0;
+    ip_header->ip_id = org_ip_header->ip_id;
+    ip_header->ip_off = org_ip_header->ip_off;
     if (type == BACKWARD) {
-        ip_header->ip_len += backward_datalen;
+        ip_header->ip_len = ntohs(40 + backward_datalen);
         ip_header->ip_ttl = 128;
-        uint32_t tmp;
-        tmp = ip_header->ip_src;
-        ip_header->ip_src = ip_header->ip_dst;
-        ip_header->ip_dst = tmp;
-    }
-
-    // tcp
-    tcpheader = (struct tcphdr*)(ip_header + (ip_header->ip_hl * 4));
-    unsigned char* tcp_data = (unsigned char*)(tcpheader + (tcpheader->th_off *4));
-    tcpheader->th_seq += strlen(tcp_data);
-    tcpheader->th_off = 20;
-    if (type == BACKWARD) {
-        uint16_t tmp;
-        tmp = tcpheader->th_sport;
-        tcpheader->th_sport = tcpheader->th_dport;
-        tcpheader->th_dport = tmp;
-        tcpheader->th_flag = TH_FIN | TH_ACK;
+        ip_header->ip_src = org_ip_header->ip_dst;
+        ip_header->ip_dst = org_ip_header->ip_src;
     }
     else if (type == FORWARD) {
-        tcpheader->th_flag = TH_RST | TH_ACK;
+        ip_header->ip_len = ntohs(40);
+        ip_header->ip_ttl = org_ip_header->ip_ttl;
+        ip_header->ip_src = org_ip_header->ip_src;
+        ip_header->ip_dst = org_ip_header->ip_dst;
     }
-    unsigned char* new_tcp_data = (unsigned char*)(tcpheader + (tcpheader->th_off * 4));
+    ip_header->ip_p = 0x06;
+    ip_header->ip_sum = 0;
+    ip_header->ip_sum = checksum((unsigned short*)ip_header, sizeof(struct ip));
+
+    // tcp
+    tcp_header = (struct tcphdr*)((uint8_t*)ip_header + 20);
+    org_tcp_header = (struct tcphdr*)((uint8_t*)org_ip_header + (org_ip_header->ip_hl * 4));
+    unsigned char* tcp_data = (unsigned char*)((uint8_t*)org_tcp_header + (org_tcp_header->th_off * 4));
+    tcp_header->th_seq = htonl(ntohl(org_tcp_header->th_seq) + strlen(tcp_data));
+    tcp_header->th_off = 5;
+    tcp_header->th_ack = org_tcp_header->th_ack;
+    tcp_header->th_x2 = org_tcp_header->th_x2;
+    if (type == BACKWARD) {
+        tcp_header->th_dport = org_tcp_header->th_sport;
+        tcp_header->th_sport = org_tcp_header->th_dport;
+        tcp_header->th_flags = TH_FIN | TH_ACK;
+    }
+    else if (type == FORWARD) {
+        tcp_header->th_dport = org_tcp_header->th_dport;
+        tcp_header->th_sport = org_tcp_header->th_sport;
+        tcp_header->th_flags = TH_RST | TH_ACK;
+    }
+    tcp_header->th_win = org_tcp_header->th_win;
+    tcp_header->th_urp = 0;
+    unsigned char* new_tcp_data = (unsigned char*)(tcp_header + (tcp_header->th_off * 4));
     if (type == BACKWARD) {
         strcpy(new_tcp_data, backward_tcpdata);
     }
+    struct pseudo_header pseudo_hdr;
+    pseudo_hdr.source_addr = ip_header->ip_src;
+    pseudo_hdr.dest_addr = ip_header->ip_dst;
+    pseudo_hdr.placeholder = 0;
+    pseudo_hdr.protocol = IPPROTO_TCP;
+    pseudo_hdr.tcp_length = htons(sizeof(struct tcphdr));
+    memcpy(&pseudo_hdr.tcp, tcp_header, sizeof(struct tcphdr));
+    tcp_header->th_sum = checksum(&pseudo_hdr, sizeof(struct pseudo_header));
 }
 
-void send_forward(const unsigned char* packet) {
-    
+void send_packet(const unsigned char* packet, uint32_t send_len) {
+    memcpy(sock_buffer, packet, send_len);
+
+    if (sendto(sd, sock_buffer, send_len, 0, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "send fail\n");
+    }
 }
 
-void send_backward(const unsigned char* packet) {
+unsigned short checksum(void *b, int len) {
+    unsigned short* buf = b;
+    unsigned int sum = 0;
+    unsigned short result;
 
+    for (sum = 0; len > 1; len -= 2) {
+        sum += *buf++;
+    }
+    if (len == 1) {
+        sum += *(unsigned char* )buf;
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    result = ~sum;
+    return result;
 }
