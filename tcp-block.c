@@ -35,7 +35,6 @@ struct pseudo_header {
     uint8_t placeholder;
     uint8_t protocol;
     uint16_t tcp_length;
-    struct tcphdr tcp;
 };
 
 uint8_t my_mac[6];
@@ -193,21 +192,22 @@ bool check_block(int type, char* block_data, const unsigned char* payload, int p
 }
 
 void blocking(const unsigned char* packet, uint32_t p_len) {
-    unsigned char forward_packet[100];
-    unsigned char backward_packet[100];
+    unsigned char forward_packet[200];
+    unsigned char backward_packet[200];
 
     make_packet(forward_packet, packet, FORWARD, p_len);
     make_packet(backward_packet, packet, BACKWARD, p_len);
 
-    send_packet(forward_packet, BLOCK_PACKET_HEADER_LEN);
     send_packet(backward_packet, BLOCK_PACKET_HEADER_LEN + backward_datalen);
+    send_packet(forward_packet, BLOCK_PACKET_HEADER_LEN);
+    
 }
 
 void make_packet(unsigned char* block_packet, const unsigned char* org_packet, int type, uint32_t p_len) {
-    if (p_len > 100) {
-        p_len = 100;
+    if (p_len > 200) {
+        p_len = 200;
     }
-    memset(block_packet, 0, 100);
+    memset(block_packet, 0, 200);
     struct ether_header *eth_header;
     struct ether_header *org_eth_header;
     struct ip *ip_header;
@@ -261,34 +261,51 @@ void make_packet(unsigned char* block_packet, const unsigned char* org_packet, i
     tcp_header = (struct tcphdr*)((uint8_t*)ip_header + 20);
     org_tcp_header = (struct tcphdr*)((uint8_t*)org_ip_header + (org_ip_header->ip_hl * 4));
     unsigned char* tcp_data = (unsigned char*)((uint8_t*)org_tcp_header + (org_tcp_header->th_off * 4));
-    tcp_header->th_seq = htonl(ntohl(org_tcp_header->th_seq) + strlen(tcp_data));
+    
     tcp_header->th_off = 5;
-    tcp_header->th_ack = org_tcp_header->th_ack;
     tcp_header->th_x2 = org_tcp_header->th_x2;
     if (type == BACKWARD) {
+        tcp_header->th_seq = org_tcp_header->th_ack;
+        tcp_header->th_ack = htonl(ntohl(org_tcp_header->th_seq) + strlen(tcp_data));
+        printf("back: %ld\n", strlen(tcp_data));
         tcp_header->th_dport = org_tcp_header->th_sport;
         tcp_header->th_sport = org_tcp_header->th_dport;
         tcp_header->th_flags = TH_FIN | TH_ACK;
     }
     else if (type == FORWARD) {
+        tcp_header->th_ack = org_tcp_header->th_ack;
+        tcp_header->th_seq = htonl(ntohl(org_tcp_header->th_seq) + strlen(tcp_data));
+        printf("for: %ld\n", strlen(tcp_data));
         tcp_header->th_dport = org_tcp_header->th_dport;
         tcp_header->th_sport = org_tcp_header->th_sport;
         tcp_header->th_flags = TH_RST | TH_ACK;
     }
     tcp_header->th_win = org_tcp_header->th_win;
     tcp_header->th_urp = 0;
-    unsigned char* new_tcp_data = (unsigned char*)(tcp_header + (tcp_header->th_off * 4));
+    unsigned char* new_tcp_data = (unsigned char*)((uint8_t*)tcp_header + (tcp_header->th_off * 4));
     if (type == BACKWARD) {
-        strcpy(new_tcp_data, backward_tcpdata);
+        memcpy(new_tcp_data, backward_tcpdata, 57);
     }
     struct pseudo_header pseudo_hdr;
     pseudo_hdr.source_addr = ip_header->ip_src;
     pseudo_hdr.dest_addr = ip_header->ip_dst;
     pseudo_hdr.placeholder = 0;
     pseudo_hdr.protocol = IPPROTO_TCP;
-    pseudo_hdr.tcp_length = htons(sizeof(struct tcphdr));
-    memcpy(&pseudo_hdr.tcp, tcp_header, sizeof(struct tcphdr));
-    tcp_header->th_sum = checksum(&pseudo_hdr, sizeof(struct pseudo_header));
+    int total_len;
+    if (type == BACKWARD)
+        total_len = sizeof(struct pseudo_header) + sizeof(struct tcphdr) + backward_datalen;
+    else
+        total_len = sizeof(struct pseudo_header) + sizeof(struct tcphdr);
+    uint8_t* buf = (uint8_t*)malloc(total_len);
+    pseudo_hdr.tcp_length = htons(total_len - sizeof(struct pseudo_header));
+    memcpy(buf, &pseudo_hdr, sizeof(struct pseudo_header));
+    if (type == BACKWARD)
+        memcpy(buf + sizeof(struct pseudo_header), tcp_header, sizeof(struct tcphdr) + backward_datalen);
+    else
+        memcpy(buf + sizeof(struct pseudo_header), tcp_header, sizeof(struct tcphdr));
+    tcp_header->th_sum = checksum(buf, total_len);
+    
+    
 }
 
 void send_packet(const unsigned char* packet, uint32_t send_len) {
